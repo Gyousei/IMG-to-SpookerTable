@@ -1,6 +1,6 @@
 <img width="1098" height="749" alt="python_4nkCqvCV4l" src="https://github.com/user-attachments/assets/7b80998b-83ad-4ca6-9f74-0f1c3bca254a" />
 
-# svg-to-spooker
+# img-to-spooker
 
 A tool built in python to take an image containing a shape that fits the following condition and converts it into a spooker table
 
