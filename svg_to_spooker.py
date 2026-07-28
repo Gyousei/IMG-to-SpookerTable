@@ -6,6 +6,14 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import customtkinter as ctk
+except ImportError:
+    sys.stderr.write(
+        "customtkinter is required. Install with: pip install customtkinter\n"
+    )
+    raise
+
 import numpy as np
 
 try:
@@ -326,7 +334,107 @@ def _smooth_contour(vertices, sigma=1.5):
     )
 
 
-def _raster_to_svg_path(image_path):
+def _morphological_close(binary, kernel_size=5):
+    """Close small gaps in a binary image via dilation then erosion.
+    Uses a square flat structuring element."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    pad = kernel_size // 2
+
+    # Dilation — True if ANY pixel in the window is True
+    padded = np.pad(binary, pad, mode='constant', constant_values=False)
+    windows = sliding_window_view(padded, (kernel_size, kernel_size)).reshape(
+        binary.shape[0], binary.shape[1], -1
+    )
+    dilated = np.any(windows, axis=2)
+
+    # Erosion — True only if ALL pixels in the window are True
+    padded = np.pad(dilated, pad, mode='constant', constant_values=True)
+    windows = sliding_window_view(padded, (kernel_size, kernel_size)).reshape(
+        binary.shape[0], binary.shape[1], -1
+    )
+    eroded = np.all(windows, axis=2)
+
+    return eroded
+
+
+
+def _largest_foreground_mask(binary):
+    from collections import deque
+    h, w = binary.shape
+    visited = np.zeros_like(binary)
+    best_mask = np.zeros_like(binary)
+    best_size = 0
+
+    for y in range(h):
+        for x in range(w):
+            if not binary[y, x] or visited[y, x]:
+                continue
+            # BFS flood fill this component
+            comp = []
+            q = deque([(x, y)])
+            visited[y, x] = True
+            while q:
+                cx, cy = q.popleft()
+                comp.append((cx, cy))
+                # 8-connected neighbours
+                for nx in (cx - 1, cx, cx + 1):
+                    for ny in (cy - 1, cy, cy + 1):
+                        if (nx != cx or ny != cy) and 0 <= nx < w and 0 <= ny < h:
+                            if binary[ny, nx] and not visited[ny, nx]:
+                                visited[ny, nx] = True
+                                q.append((nx, ny))
+            if len(comp) > best_size:
+                best_size = len(comp)
+                best_mask.fill(False)
+                for px, py in comp:
+                    best_mask[py, px] = True
+    return best_mask
+
+
+def _trace_outer_boundary(binary):
+    h, w = binary.shape
+    start = None
+    for y in range(h):
+        for x in range(w):
+            if binary[y, x]:
+                start = (x, y)
+                break
+        if start is not None:
+            break
+    if start is None:
+        return []
+
+    dx = [1, 1, 0, -1, -1, -1, 0, 1]
+    dy = [0, 1, 1, 1, 0, -1, -1, -1]
+
+    backtrack = 4  
+
+    boundary = []
+    cx, cy = start
+
+    while True:
+        boundary.append((cx, cy))
+
+        found = False
+        for i in range(8):
+            d = (backtrack + 1 + i) % 8
+            nx, ny = cx + dx[d], cy + dy[d]
+            if 0 <= nx < w and 0 <= ny < h and binary[ny, nx]:
+                cx, cy = nx, ny
+                backtrack = (d + 4) % 8 
+                found = True
+                break
+
+        if not found:
+            break
+
+        if (cx, cy) == start:
+            break
+
+    return boundary
+
+
+def _raster_to_contour_points(image_path):
     from matplotlib import pyplot as plt
 
     img = plt.imread(image_path)
@@ -342,73 +450,63 @@ def _raster_to_svg_path(image_path):
 
     gray = np.mean(img_rgb, axis=2)
 
-    blurred = _gaussian_blur(gray, sigma=1.5)
+    blurred = _gaussian_blur(gray, sigma=3.0)
 
     threshold = _otsu_threshold(blurred)
     binary = blurred < threshold
 
     h, w = gray.shape
-    corners = [
-        gray[0, 0],
-        gray[0, w - 1],
-        gray[h - 1, 0],
-        gray[h - 1, w - 1],
-    ]
-    mean_corner = sum(corners) / len(corners)
-
-    if mean_corner > threshold:
-        pass
-    else:
+    border_pixels = np.concatenate([
+        gray[0, :],
+        gray[-1, :],
+        gray[1:-1, 0],
+        gray[1:-1, -1],
+    ])
+    if np.mean(border_pixels) < threshold:
         binary = ~binary
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    cs = ax.contour(binary, levels=[0.5])
-    plt.close(fig)
-    #trace shape from converted raster image
-    paths = []
-    for segs in cs.allsegs:
-        for seg in segs:
-            if len(seg) >= 3:
-                paths.append(seg)
+    binary = _morphological_close(binary, kernel_size=5)
 
-    if not paths:
+    raw = _trace_outer_boundary(binary)
+    if len(raw) < 6:
         raise ValueError(
-            "Can't detect a valid table shape in the image. "
-            "If this continues, use an image editor to raise "
-            "the contrast so that the shape is more clear."
+            "The detected shape is too small to trace.  "
+            "Use a larger or higher-contrast image."
+        )
+    #try to find the largest shape if multiple are detected
+    binary = _largest_foreground_mask(binary)
+
+    raw = _trace_outer_boundary(binary)
+    if len(raw) < 6:
+        raise ValueError(
+            "The detected shape is too small to trace.  "
+            "Use a larger or higher-contrast image."
         )
 
-    longest = max(paths, key=len)
+    smoothed = _smooth_contour(raw, sigma=1.5)
 
-    smoothed = _smooth_contour(longest, sigma=1.5)
-
-    parts = [f"M {smoothed[0][0]:.4f},{smoothed[0][1]:.4f}"]
-    for p in smoothed[1:]:
-        parts.append(f"L {p[0]:.4f},{p[1]:.4f}")
-    parts.append("Z")
-
-    return " ".join(parts)
+    return [(float(p[0]), float(p[1])) for p in smoothed]
 
 
 def convert_image_to_polygon(image_path, target_vertices):
-    #translate converted raster image to polygon
 
     ext = os.path.splitext(image_path)[1].lower()
 
     if ext in RASTER_EXTENSIONS:
-        d = _raster_to_svg_path(image_path)
-        try:
-            main = svgpathtools.parse_path(d)
-        except Exception as exc:
-            raise ValueError(
-                f"Failed to parse traced path from image: {exc}"
-            )
-        if main is None:
-            raise ValueError(
-                "Failed to extract a valid path from the image. "
-                "Try a different image with a clearer shape."
-            )
+        raw_points = _raster_to_contour_points(image_path)
+        normalized = normalize_to_box(raw_points, half_size=HALF_BOX)
+        resampled = _uniform_resample(normalized, target_vertices)
+        cleaned = dedupe_all(resampled, eps=EPS)
+        simplified = simplify_collinear(cleaned)
+        ordered = order_counterclockwise_from_topleft(simplified)
+
+        metadata = {
+            "raw_vertices": len(raw_points),
+            "final_vertices": len(ordered),
+            "target_vertices": target_vertices,
+        }
+        return ordered, metadata
+
     elif ext == '.svg':
         paths = parse_paths_from_svg(image_path)
         if not paths:
@@ -420,6 +518,7 @@ def convert_image_to_polygon(image_path, target_vertices):
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
+    # SVG path processing
     try:
         arc_length_svg = main.length()
     except Exception:
@@ -494,7 +593,7 @@ class SvgToSpooker:
     def __init__(self, root):
         self.root = root
         self.root.title("Image to Spooker Table Converter")
-        self.root.geometry("1100x720")
+        self.root.geometry("1200x720")
         self.root.minsize(800, 520)
 
         self.filepath = None
@@ -536,7 +635,7 @@ class SvgToSpooker:
         style.map("TEntry", fieldbackground=[("focus", "#161b22")])
         style.configure("TPanedwindow", background=bg, bordercolor=border)
         style.configure("Vertical.TScrollbar", background=accent, bordercolor=border,
-                        arrowcolor=fg)
+                        arrowcolor=fg, troughcolor=bg)
         style.map("Vertical.TScrollbar",
                    background=[("active", "#1c2128")])
         style.configure("Horizontal.TScale", background=bg, troughcolor=border,
@@ -560,75 +659,112 @@ class SvgToSpooker:
         #resolution + buttons
         ttk.Label(controls, text="Resolution:").grid(row=1, column=0, sticky="e",
                                                      pady=(8, 0))
-        self.resolution_var = tk.StringVar(value="50")
-        self.resolution_int = tk.IntVar(value=50)
+        self.resolution_var = tk.StringVar(value="24")
+        self.resolution_int = tk.IntVar(value=24)
         res_entry = ttk.Entry(controls, textvariable=self.resolution_var,
                               width=8)
         res_entry.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(0, 4))
-        res_slider = ttk.Scale(controls, from_=3, to=200, orient=tk.HORIZONTAL,
+        res_slider = ttk.Scale(controls, from_=8, to=48, orient=tk.HORIZONTAL,
                                variable=self.resolution_int,
                                command=self._resolution_slider_moved)
         res_slider.grid(row=1, column=2, sticky="ew", pady=(8, 0), padx=(0, 8))
         self.resolution_var.trace_add("write", self._resolution_entry_typed)
 
-        self.open_gen_btn = ttk.Button(
+        btn_style = dict(
+            corner_radius=8,
+            fg_color="#010409",
+            hover_color="#1c2128",
+            text_color="#e6edf3",
+            border_width=1,
+            border_color="#30363d",
+        )
+        self.open_gen_btn = ctk.CTkButton(
             controls, text="Open Online Generator",
-            command=self._open_generator,
+            command=self._open_generator, **btn_style,
         )
         self.open_gen_btn.grid(row=0, column=4, rowspan=2, padx=(4, 4),
                                 sticky="ns")
-        self.convert_btn = ttk.Button(controls, text="Convert",
-                                      command=self._convert,
-                                      state=tk.DISABLED)
+        self.convert_btn = ctk.CTkButton(
+            controls, text="Convert",
+            command=self._convert, state="disabled", **btn_style,
+        )
         self.convert_btn.grid(row=0, column=5, rowspan=2, padx=(4, 4),
                               sticky="ns")
-        self.copy_btn = ttk.Button(controls, text="Copy to clipboard",
-                                    command=self._copy_output,
-                                    state=tk.DISABLED)
+        self.copy_btn = ctk.CTkButton(
+            controls, text="Copy to Clipboard",
+            command=self._copy_output, state="disabled", **btn_style,
+        )
         self.copy_btn.grid(row=0, column=6, rowspan=2, padx=(4, 0),
                             sticky="ns")
 
         controls.columnconfigure(2, weight=1)
         controls.columnconfigure(4, weight=1)
 
-        paned = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-
-        plot_frame = ttk.Frame(paned)
-        paned.add(plot_frame, weight=3)
+        content = ttk.Frame(outer)
+        content.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        content.columnconfigure(0, weight=1)   
+        content.columnconfigure(1, weight=0)   
 
         bg = "#0d1117"
         fg = "#e6edf3"
         border = "#30363d"
-        self.fig = Figure(figsize=(5, 5), dpi=100, facecolor=bg)
-        self.ax = self.fig.add_subplot(111, facecolor=bg)
-        self.ax.set_aspect("equal")
-        self.ax.set_xlim(-1.6, 1.6)
-        self.ax.set_ylim(-1.6, 1.6)
-        self.ax.grid(True, alpha=0.3, color=border)
-        self.ax.axhline(0, color=border, linewidth=0.5)
-        self.ax.axvline(0, color=border, linewidth=0.5)
-        self.ax.set_title("Table Preview", color=fg, fontsize=11)
-        self.ax.tick_params(colors=fg, which="both")
-        for spine in self.ax.spines.values():
-            spine.set_color(border)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+
+
+        plot_pane = ttk.Frame(content)
+        plot_pane.grid(row=0, column=0, sticky="nsew")
+        plot_pane.rowconfigure(0, weight=1)
+        plot_pane.columnconfigure(0, weight=1)
+
+        self.fig = Figure(figsize=(10, 5), dpi=100, facecolor=bg)
+        self.ax_orig = self.fig.add_subplot(121, facecolor=bg)
+        self.ax_plot = self.fig.add_subplot(122, facecolor=bg)
+        self.fig.subplots_adjust(wspace=0.05, left=0.01, right=0.99,
+                                 top=0.92, bottom=0.05)
+        for ax in (self.ax_orig, self.ax_plot):
+            ax.set_facecolor(bg)
+            ax.tick_params(colors=fg, which="both")
+            for spine in ax.spines.values():
+                spine.set_color(border)
+
+
+        self.ax_orig.axis("off")
+        self.ax_orig.set_title("Original Image", color=fg, fontsize=11)
+
+        self.ax_plot.set_aspect("equal")
+        self.ax_plot.set_xlim(-1.6, 1.6)
+        self.ax_plot.set_ylim(-1.6, 1.6)
+        self.ax_plot.grid(True, alpha=0.3, color=border)
+        self.ax_plot.axhline(0, color=border, linewidth=0.5)
+        self.ax_plot.axvline(0, color=border, linewidth=0.5)
+        self.ax_plot.set_title("Table Preview", color=fg, fontsize=11)
+        self.ax_plot.add_patch(
+            matplotlib.patches.Rectangle(
+                (-1.5, -1.5), 3.0, 3.0,
+                fill=False, edgecolor=border,
+                linestyle="--", linewidth=1.0,
+            )
+        )
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_pane)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._draw_axes_only()
 
-        text_frame = ttk.Frame(paned)
-        paned.add(text_frame, weight=2)
-        ttk.Label(text_frame,
-                  text="Output vertices (x,y per line):").pack(anchor="w")
-        text_container = ttk.Frame(text_frame)
-        text_container.pack(fill=tk.BOTH, expand=True)
+        text_pane = tk.Frame(content, width=200, bg="#0d1117",
+                             highlightthickness=0)
+        text_pane.grid(row=0, column=1, sticky="ns")
+        text_pane.grid_propagate(False)
+        content.columnconfigure(1, weight=0)
+        ttk.Label(text_pane,
+                  text="Output vertices:").pack(anchor="w")
         self.output_text = tk.Text(
-            text_container, wrap=tk.NONE, font=("Consolas", 10),
+            text_pane, wrap=tk.NONE, font=("Consolas", 9),
+            width=22, height=10,
             undo=False, bg="#010409", fg=fg, insertbackground=fg,
             selectbackground="#580aff", selectforeground=fg,
         )
         self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ysb = ttk.Scrollbar(text_container, orient="vertical",
+        ysb = ttk.Scrollbar(text_pane, orient="vertical",
+                            style="Vertical.TScrollbar",
                             command=self.output_text.yview)
         ysb.pack(side=tk.RIGHT, fill=tk.Y)
         self.output_text.configure(yscrollcommand=ysb.set)
@@ -657,13 +793,13 @@ class SvgToSpooker:
             return
         self.filepath = path
         self.file_label.config(text=os.path.basename(path))
-        self.convert_btn.config(state=tk.NORMAL)
+        self.convert_btn.configure(state="normal")
+        self._refresh_original_image()
         self.status_var.set(
             f"Loaded {os.path.basename(path)} "
             f"({os.path.getsize(path):,} bytes). Click Convert."
         )
 
-    #resolution slider and box parity
     def _resolution_slider_moved(self, value):
         if getattr(self, '_updating', False):
             return
@@ -678,11 +814,9 @@ class SvgToSpooker:
         raw = self.resolution_var.get().strip()
         try:
             val = int(raw)
-            val = max(3, min(200, val))
+            if val <= 0:
+                raise ValueError
             self.resolution_int.set(val)
-            clamped = str(val)
-            if self.resolution_var.get() != clamped:
-                self.resolution_var.set(clamped)
         except ValueError:
             pass
         self._updating = False
@@ -702,7 +836,7 @@ class SvgToSpooker:
 
     def _convert(self):
         if not self.filepath:
-            messagebox.showinfo("No file", "Select an SVG file first.")
+            messagebox.showinfo("No file", "Select an image first.")
             return
         try:
             resolution = self._parse_resolution()
@@ -721,12 +855,15 @@ class SvgToSpooker:
         self.metadata = metadata
         self._refresh_plot()
         self._refresh_output()
-        self.copy_btn.config(state=tk.NORMAL)
+        self.copy_btn.configure(state="normal")
         self.status_var.set(
             f"Generated {metadata['final_vertices']} vertices "
             f"(target {resolution}, sampled {metadata['raw_vertices']} "
-            f"before dedupe; arc_len={metadata['arc_length_svg']:.1f}, "
-            f"step={metadata['step_svg']:.4f})."
+            f"before dedupe"
+            + (f"; arc_len={metadata['arc_length_svg']:.1f}, "
+               f"step={metadata['step_svg']:.4f}"
+               if 'arc_length_svg' in metadata else "")
+            + ")."
         )
 
     def _open_generator(self):
@@ -750,22 +887,26 @@ class SvgToSpooker:
     #plotting and output renderer
 
     def _draw_axes_only(self):
-        bg = "#0d1117"
         fg = "#e6edf3"
         border = "#30363d"
-        self.ax.clear()
-        self.ax.set_facecolor(bg)
-        self.ax.set_aspect("equal")
-        self.ax.set_xlim(-1.6, 1.6)
-        self.ax.set_ylim(-1.6, 1.6)
-        self.ax.grid(True, alpha=0.3, color=border)
-        self.ax.axhline(0, color=border, linewidth=0.5)
-        self.ax.axvline(0, color=border, linewidth=0.5)
-        self.ax.tick_params(colors=fg, which="both")
-        self.ax.set_title("Table Preview", color=fg, fontsize=11)
-        for spine in self.ax.spines.values():
+        self.ax_orig.clear()
+        self.ax_orig.set_facecolor("#0d1117")
+        self.ax_orig.axis("off")
+        self.ax_orig.set_title("Original Image", color=fg, fontsize=11)
+
+        self.ax_plot.clear()
+        self.ax_plot.set_facecolor("#0d1117")
+        self.ax_plot.set_aspect("equal")
+        self.ax_plot.set_xlim(-1.6, 1.6)
+        self.ax_plot.set_ylim(-1.6, 1.6)
+        self.ax_plot.grid(True, alpha=0.3, color=border)
+        self.ax_plot.axhline(0, color=border, linewidth=0.5)
+        self.ax_plot.axvline(0, color=border, linewidth=0.5)
+        self.ax_plot.tick_params(colors=fg, which="both")
+        self.ax_plot.set_title("Table Preview", color=fg, fontsize=11)
+        for spine in self.ax_plot.spines.values():
             spine.set_color(border)
-        self.ax.add_patch(
+        self.ax_plot.add_patch(
             matplotlib.patches.Rectangle(
                 (-1.5, -1.5), 3.0, 3.0,
                 fill=False, edgecolor=border,
@@ -774,24 +915,53 @@ class SvgToSpooker:
         )
         self.canvas.draw_idle()
 
+    def _refresh_original_image(self):
+        self.ax_orig.clear()
+        self.ax_orig.set_facecolor("#0d1117")
+        self.ax_orig.axis("off")
+        self.ax_orig.set_title("Original Image", color="#e6edf3", fontsize=11)
+        if not self.filepath:
+            self.canvas.draw_idle()
+            return
+        ext = os.path.splitext(self.filepath)[1].lower()
+        if ext in RASTER_EXTENSIONS:
+            from matplotlib import pyplot as plt
+            img = plt.imread(self.filepath)
+            self.ax_orig.imshow(img, aspect="equal")
+        else:
+            border = "#30363d"
+            self.ax_orig.text(
+                0.5, 0.5, "Unable to render SVG images\nwithin this container.",
+                ha="center", va="center", color="#e6edf3", fontsize=10,
+                transform=self.ax_orig.transAxes,
+            )
+            self.ax_orig.add_patch(
+                matplotlib.patches.Rectangle(
+                    (0.05, 0.05), 0.9, 0.9,
+                    fill=False, edgecolor=border, linewidth=1.0,
+                    linestyle="--", transform=self.ax_orig.transAxes,
+                )
+            )
+        self.canvas.draw_idle()
+
     def _refresh_plot(self):
         bg = "#0d1117"
         fg = "#e6edf3"
         border = "#30363d"
         poly_color = "#580aff"
-        self.ax.clear()
-        self.ax.set_facecolor(bg)
-        self.ax.set_aspect("equal")
-        self.ax.set_xlim(-1.6, 1.6)
-        self.ax.set_ylim(-1.6, 1.6)
-        self.ax.grid(True, alpha=0.3, color=border)
-        self.ax.axhline(0, color=border, linewidth=0.5)
-        self.ax.axvline(0, color=border, linewidth=0.5)
-        self.ax.tick_params(colors=fg, which="both")
-        self.ax.set_title("Table Preview", color=fg, fontsize=11)
-        for spine in self.ax.spines.values():
+        self.ax_plot.clear()
+        self.ax_plot.set_facecolor(bg)
+        self.ax_plot.set_aspect("equal")
+        self.ax_plot.set_xlim(-1.6, 1.6)
+        self.ax_plot.set_ylim(-1.6, 1.6)
+        self.ax_plot.grid(True, alpha=0.3, color=border)
+        self.ax_plot.axhline(0, color=border, linewidth=0.5)
+        self.ax_plot.axvline(0, color=border, linewidth=0.5)
+        self.ax_plot.tick_params(colors=fg, which="both")
+        self.ax_plot.set_title("Table Preview", color=fg, fontsize=11)
+        for spine in self.ax_plot.spines.values():
             spine.set_color(border)
-        self.ax.add_patch(
+        self.ax_plot.add_patch(
             matplotlib.patches.Rectangle(
                 (-1.5, -1.5), 3.0, 3.0,
                 fill=False, edgecolor=border,
@@ -801,15 +971,15 @@ class SvgToSpooker:
         if self.polygon:
             xs = [p[0] for p in self.polygon] + [self.polygon[0][0]]
             ys = [p[1] for p in self.polygon] + [self.polygon[0][1]]
-            self.ax.fill(xs, ys, color=poly_color, alpha=0.25)
-            self.ax.plot(xs, ys, "-", color=poly_color, linewidth=2.0)
+            self.ax_plot.fill(xs, ys, color=poly_color, alpha=0.25)
+            self.ax_plot.plot(xs, ys, "-", color=poly_color, linewidth=2.0)
             x0, y0 = self.polygon[0]
-            self.ax.plot(x0, y0, "o", color=poly_color, markersize=7,
-                         markeredgecolor="#ffffff", markeredgewidth=1.0)
+            self.ax_plot.plot(x0, y0, "o", color=poly_color, markersize=7,
+                              markeredgecolor="#ffffff", markeredgewidth=1.0)
             for i, (x, y) in enumerate(self.polygon):
                 if i == 0:
                     continue
-                self.ax.plot(x, y, ".", color=poly_color, markersize=3)
+                self.ax_plot.plot(x, y, ".", color=poly_color, markersize=3)
         self.canvas.draw_idle()
 
     def _refresh_output(self):
@@ -821,10 +991,18 @@ class SvgToSpooker:
         self.output_text.mark_set(tk.INSERT, "1.0")
 
 def main():
-    root = tk.Tk()
-    root.configure(bg="#0d1117")
-    SvgToSpooker(root)
-    root.mainloop()
+    import traceback
+    try:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        root = ctk.CTk()
+        SvgToSpooker(root)
+        root.mainloop()
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.write("\nPress Enter to exit...")
+        input()
+        raise
 
 
 if __name__ == "__main__":
