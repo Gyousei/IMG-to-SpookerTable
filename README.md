@@ -25,7 +25,7 @@ Any vertex order issues can be fixed within the table generator itself by just c
 
 ## What is "resolution"?
 
-Resolution (default 50) just specifies how many vertices you want the output table to have. 
+Resolution (default 24) just specifies how many vertices you want the output table to have. 
 Lower values may truncate curves, higher values may cause tables to take longer for the generator (or devs) to parse.
 Try and find the lowest value that conserves the general shape of your table
 
