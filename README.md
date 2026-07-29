@@ -29,6 +29,8 @@ Resolution (default 24) just specifies how many vertices you want the output tab
 Lower values may truncate curves, higher values may cause tables to take longer for the generator (or devs) to parse.
 Try and find the lowest value that conserves the general shape of your table
 
+Custom values are supported by manual typing input. The slider stays within the recommended vertex count range (8 to 48)
+
 
 ## GUI
 
