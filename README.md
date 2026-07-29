@@ -1,4 +1,4 @@
-<img width="1098" height="749" alt="python_4nkCqvCV4l" src="https://github.com/user-attachments/assets/7b80998b-83ad-4ca6-9f74-0f1c3bca254a" />
+<img width="1200" height="750" alt="img-to-spooker_C53FdSvZwD" src="https://github.com/user-attachments/assets/b918c871-9a11-4d02-8ab1-0d12603ac1a7" />
 
 # img-to-spooker
 
